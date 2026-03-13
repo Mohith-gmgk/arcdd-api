@@ -1,19 +1,27 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tensorflow as tf
 import numpy as np
 from PIL import Image
 import io
 import os
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# ─── Load Model ──────────────────────────────────────────────────
-print("⏳ Loading model...")
+# ─── Lazy model loading ───────────────────────────────────────────
+# Load model only on first request to avoid gunicorn startup timeout
 MODEL_PATH = os.environ.get("MODEL_PATH", "model.keras")
-model = tf.keras.models.load_model(MODEL_PATH)
-print("✅ Model loaded!")
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        print("⏳ Loading model...")
+        import tensorflow as tf
+        _model = tf.keras.models.load_model(MODEL_PATH)
+        print("✅ Model loaded!")
+    return _model
 
 # ─── 44 Class Names (exact order from training) ──────────────────
 CLASS_NAMES = [
@@ -65,60 +73,50 @@ CLASS_NAMES = [
 
 IMG_SIZE = (224, 224)
 
-# ─── Pretty display names ─────────────────────────────────────────
 def format_class_name(raw):
     parts = raw.split("__")
     crop    = parts[0].replace("_", " ").title()
     disease = parts[1].replace("_", " ").replace("-", " ").title() if len(parts) > 1 else ""
     return crop, disease
 
-# ─── Health check ─────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"status": "ok", "model": "EfficientNetB2", "classes": len(CLASS_NAMES)})
 
-# ─── Predict endpoint ─────────────────────────────────────────────
+@app.route("/warmup", methods=["GET"])
+def warmup():
+    try:
+        get_model()
+        return jsonify({"status": "ready", "model": "EfficientNetB2"})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route("/predict", methods=["POST"])
 def predict():
     if "image" not in request.files:
         return jsonify({"error": "No image file provided"}), 400
-
     file = request.files["image"]
     if not file.filename:
         return jsonify({"error": "Empty filename"}), 400
-
     try:
-        # Read and preprocess image
+        start = time.time()
+        model = get_model()
         img_bytes = file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = img.resize(IMG_SIZE)
         img_array = np.array(img, dtype=np.float32)
-
-        # EfficientNet preprocessing (same as training)
         from tensorflow.keras.applications.efficientnet import preprocess_input
         img_input = preprocess_input(np.expand_dims(img_array, axis=0))
-
-        # Run inference
         preds = model.predict(img_input, verbose=0)[0]
-
-        # Top prediction
+        elapsed = round((time.time() - start) * 1000)
         top_idx  = int(np.argmax(preds))
         top_conf = float(preds[top_idx])
         crop, disease = format_class_name(CLASS_NAMES[top_idx])
-
-        # Top 5 predictions
         top5_indices = np.argsort(preds)[::-1][:5]
         top5 = []
         for i in top5_indices:
             c, d = format_class_name(CLASS_NAMES[i])
-            top5.append({
-                "raw":        CLASS_NAMES[i],
-                "crop":       c,
-                "disease":    d,
-                "confidence": float(preds[i]),
-            })
-
-        # Severity based on confidence + disease type
+            top5.append({"raw": CLASS_NAMES[i], "crop": c, "disease": d, "confidence": float(preds[i])})
         is_healthy = "healthy" in CLASS_NAMES[top_idx].lower()
         if is_healthy:
             severity = "None"
@@ -128,25 +126,20 @@ def predict():
             severity = "Medium"
         else:
             severity = "Low"
-
+        print(f"✅ Predicted: {disease} ({crop}) — {top_conf:.1%} in {elapsed}ms")
         return jsonify({
             "success": True,
             "prediction": {
-                "raw":        CLASS_NAMES[top_idx],
-                "crop":       crop,
-                "disease":    disease,
-                "confidence": top_conf,
-                "severity":   severity,
-                "is_healthy": is_healthy,
+                "raw": CLASS_NAMES[top_idx], "crop": crop, "disease": disease,
+                "confidence": top_conf, "severity": severity, "is_healthy": is_healthy,
             },
-            "top5":  top5,
+            "top5": top5,
             "model": "EfficientNetB2",
+            "inference_time_ms": elapsed,
         })
-
     except Exception as e:
-        print(f"Prediction error: {e}")
+        print(f"❌ Prediction error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
