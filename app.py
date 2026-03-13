@@ -17,12 +17,8 @@ def get_interpreter():
     global _interpreter
     if _interpreter is None:
         print("⏳ Loading TFLite model...")
-        try:
-            import tflite_runtime.interpreter as tflite
-            _interpreter = tflite.Interpreter(model_path=MODEL_PATH)
-        except ImportError:
-            import tensorflow as tf
-            _interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        import tensorflow as tf
+        _interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         _interpreter.allocate_tensors()
         print("✅ TFLite model loaded!")
     return _interpreter
