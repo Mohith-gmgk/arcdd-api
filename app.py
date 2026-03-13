@@ -9,65 +9,47 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-# ─── Lazy model loading ───────────────────────────────────────────
-# Load model only on first request to avoid gunicorn startup timeout
-MODEL_PATH = os.environ.get("MODEL_PATH", "model.keras")
-_model = None
+# ─── TFLite Interpreter ───────────────────────────────────────────
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.tflite")
+_interpreter = None
 
-def get_model():
-    global _model
-    if _model is None:
-        print("⏳ Loading model...")
-        import tensorflow as tf
-        _model = tf.keras.models.load_model(MODEL_PATH)
-        print("✅ Model loaded!")
-    return _model
+def get_interpreter():
+    global _interpreter
+    if _interpreter is None:
+        print("⏳ Loading TFLite model...")
+        try:
+            import tflite_runtime.interpreter as tflite
+            _interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+        except ImportError:
+            import tensorflow as tf
+            _interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        _interpreter.allocate_tensors()
+        print("✅ TFLite model loaded!")
+    return _interpreter
 
-# ─── 44 Class Names (exact order from training) ──────────────────
+# Preload in background thread
+import threading
+threading.Thread(target=get_interpreter, daemon=True).start()
+
+# ─── 44 Class Names ───────────────────────────────────────────────
 CLASS_NAMES = [
-    "apple__apple_scab",
-    "apple__black_rot",
-    "apple__cedar_apple_rust",
-    "apple__healthy",
-    "cassava__bacterial_blight_cbb",
-    "cassava__brown_streak_disease_cbsd",
-    "cassava__green_mottle_cgm",
-    "cassava__healthy",
-    "cassava__mosaic_disease_cmd",
-    "cherry_including_sour__healthy",
-    "cherry_including_sour__powdery_mildew",
-    "corn_maize__cercospora_leaf_spot_gray_leaf_spot",
-    "corn_maize__common_rust",
-    "corn_maize__healthy",
-    "corn_maize__northern_leaf_blight",
-    "grape__black_rot",
-    "grape__esca_black_measles",
-    "grape__healthy",
-    "grape__leaf_blight_isariopsis_leaf_spot",
-    "orange__haunglongbing_citrus_greening",
-    "peach__bacterial_spot",
-    "peach__healthy",
-    "pepper_bell__bacterial_spot",
-    "pepper_bell__healthy",
-    "potato__early_blight",
-    "potato__healthy",
-    "potato__late_blight",
-    "rice__brownspot",
-    "rice__healthy",
-    "rice__hispa",
-    "rice__leafblast",
-    "squash__powdery_mildew",
-    "strawberry__healthy",
-    "strawberry__leaf_scorch",
-    "tomato__bacterial_spot",
-    "tomato__early_blight",
-    "tomato__healthy",
-    "tomato__late_blight",
-    "tomato__leaf_mold",
-    "tomato__septoria_leaf_spot",
-    "tomato__spider_mites_two-spotted_spider_mite",
-    "tomato__target_spot",
-    "tomato__tomato_mosaic_virus",
+    "apple__apple_scab", "apple__black_rot", "apple__cedar_apple_rust",
+    "apple__healthy", "cassava__bacterial_blight_cbb",
+    "cassava__brown_streak_disease_cbsd", "cassava__green_mottle_cgm",
+    "cassava__healthy", "cassava__mosaic_disease_cmd",
+    "cherry_including_sour__healthy", "cherry_including_sour__powdery_mildew",
+    "corn_maize__cercospora_leaf_spot_gray_leaf_spot", "corn_maize__common_rust",
+    "corn_maize__healthy", "corn_maize__northern_leaf_blight",
+    "grape__black_rot", "grape__esca_black_measles", "grape__healthy",
+    "grape__leaf_blight_isariopsis_leaf_spot", "orange__haunglongbing_citrus_greening",
+    "peach__bacterial_spot", "peach__healthy", "pepper_bell__bacterial_spot",
+    "pepper_bell__healthy", "potato__early_blight", "potato__healthy",
+    "potato__late_blight", "rice__brownspot", "rice__healthy", "rice__hispa",
+    "rice__leafblast", "squash__powdery_mildew", "strawberry__healthy",
+    "strawberry__leaf_scorch", "tomato__bacterial_spot", "tomato__early_blight",
+    "tomato__healthy", "tomato__late_blight", "tomato__leaf_mold",
+    "tomato__septoria_leaf_spot", "tomato__spider_mites_two-spotted_spider_mite",
+    "tomato__target_spot", "tomato__tomato_mosaic_virus",
     "tomato__tomato_yellow_leaf_curl_virus",
 ]
 
@@ -79,17 +61,19 @@ def format_class_name(raw):
     disease = parts[1].replace("_", " ").replace("-", " ").title() if len(parts) > 1 else ""
     return crop, disease
 
+def preprocess_image(img):
+    img = img.resize(IMG_SIZE)
+    img_array = np.array(img, dtype=np.float32)
+    # EfficientNet preprocess_input manually (same as training)
+    img_array /= 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_array = (img_array - mean) / std
+    return np.expand_dims(img_array, axis=0)
+
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "model": "EfficientNetB2", "classes": len(CLASS_NAMES)})
-
-@app.route("/warmup", methods=["GET"])
-def warmup():
-    try:
-        get_model()
-        return jsonify({"status": "ready", "model": "EfficientNetB2"})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+    return jsonify({"status": "ok", "model": "EfficientNetB2-TFLite", "classes": len(CLASS_NAMES)})
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -100,33 +84,35 @@ def predict():
         return jsonify({"error": "Empty filename"}), 400
     try:
         start = time.time()
-        model = get_model()
+
+        interpreter = get_interpreter()
+        input_details  = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+
         img_bytes = file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = img.resize(IMG_SIZE)
-        img_array = np.array(img, dtype=np.float32)
-        from tensorflow.keras.applications.efficientnet import preprocess_input
-        img_input = preprocess_input(np.expand_dims(img_array, axis=0))
-        preds = model.predict(img_input, verbose=0)[0]
-        elapsed = round((time.time() - start) * 1000)
+        img_input = preprocess_image(img)
+
+        interpreter.set_tensor(input_details[0]["index"], img_input)
+        interpreter.invoke()
+        preds = interpreter.get_tensor(output_details[0]["index"])[0]
+
+        elapsed  = round((time.time() - start) * 1000)
         top_idx  = int(np.argmax(preds))
         top_conf = float(preds[top_idx])
         crop, disease = format_class_name(CLASS_NAMES[top_idx])
+
         top5_indices = np.argsort(preds)[::-1][:5]
         top5 = []
         for i in top5_indices:
             c, d = format_class_name(CLASS_NAMES[i])
             top5.append({"raw": CLASS_NAMES[i], "crop": c, "disease": d, "confidence": float(preds[i])})
+
         is_healthy = "healthy" in CLASS_NAMES[top_idx].lower()
-        if is_healthy:
-            severity = "None"
-        elif top_conf >= 0.85:
-            severity = "High"
-        elif top_conf >= 0.55:
-            severity = "Medium"
-        else:
-            severity = "Low"
+        severity = "None" if is_healthy else ("High" if top_conf >= 0.85 else ("Medium" if top_conf >= 0.55 else "Low"))
+
         print(f"✅ Predicted: {disease} ({crop}) — {top_conf:.1%} in {elapsed}ms")
+
         return jsonify({
             "success": True,
             "prediction": {
